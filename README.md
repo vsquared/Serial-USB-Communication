@@ -13,3 +13,4 @@ Code may be run in XCode by following these steps:
 8. Hit 'Disconnect' when done.
 
 <img width="759" height="225" alt="sandbox" src="https://github.com/user-attachments/assets/e9fa307d-c76d-4047-8b96-ba19ee91b8af" />
+<img width="758" height="536" alt="serial" src="https://github.com/user-attachments/assets/7daf8887-416d-402e-bf68-f3bb16d5aeb7" />
