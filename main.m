@@ -1,0 +1,364 @@
+//
+//  main.m
+//  SerialC_ObjC
+//
+// **** SandBox must be set to 'NO' or it won't run **** //
+
+// Reference: https://forum.arduino.cc/t/serial-read-in-objective-c-under-osx/37211/2
+
+#import <Cocoa/Cocoa.h>
+#include <stdio.h>   /* Standard input/output definitions */
+#include <string.h>  /* String function definitions */
+#include <unistd.h>  /* UNIX standard function definitions */
+#include <fcntl.h>   /* File control definitions */
+#include <errno.h>   /* Error number definitions */
+#include <termios.h> /* POSIX terminal control definitions */
+
+#define _wndW  750
+#define _wndH  500
+
+@interface GraphView : NSView {
+    NSBezierPath *path;
+}
+@property (retain) NSBezierPath *path;
+@end
+
+@implementation GraphView
+@synthesize path;
+
+- (id)initWithFrame:(NSRect)frameRect {
+    if ((self = [super initWithFrame:frameRect]) != nil) {
+        // Add initialization code here
+    }
+    return self;
+}
+
+- (void)drawRect:(NSRect)rect {
+    // ****** Background ***** //
+    [[NSColor orangeColor] set];
+    [NSBezierPath fillRect:rect];
+    
+    [[NSColor blackColor]set];
+    [path setLineWidth:3.0];
+    [path stroke];
+}
+
+// ----- Use this if you want 0,0 (origin) to be top, left ---- //
+// ----- Otherwise origin will be at bottom, left (Unflipped) ----- //
+-(BOOL)isFlipped {
+    return NO;
+}
+@end
+
+@interface AppDelegate : NSObject <NSApplicationDelegate,NSWindowDelegate> {
+    NSWindow *window;
+    NSBezierPath *path;
+    BOOL closePort;
+    NSTextView *txtView;
+    NSScrollView *graphScrlView;
+    NSScrollView *txtScrlView;
+    NSTextField *infoFld;
+    NSPopUpButton *portsBtn;
+    NSComboBox *baudCombo;
+    GraphView *graphView;
+    NSString *comboBaudRate;
+    speed_t baudRate;
+    NSPoint dataPt;
+    int fd;
+    int dataValue;
+    int counter;
+    int currWndW ;
+}
+
+void USBSerialGetline(int fd, char buffer[]);
+
+- (void) openPortAction: (id)sender;
+- (void) closePortAction: (id)sender;
+- (void) getSerialPorts;
+- (void) portsBtnAction: (id)sender;
+- (void) buildMenu;
+- (void) buildWindow;
+@end
+
+@implementation AppDelegate
+
+- (void) getSerialPorts {
+    NSTask *task = [[NSTask alloc] init];
+    [task setLaunchPath: @"/bin/sh"];                      // launch a shell
+    [task setArguments: @[@"-c", @"ls /dev/cu.*"]];
+    NSPipe *pipe = [NSPipe pipe];
+    [task setStandardOutput: pipe];
+    [task launch];
+    [task waitUntilExit];
+    NSData *ports = [[pipe fileHandleForReading] readDataToEndOfFile];
+    NSString *string = [[NSString alloc] initWithData:ports encoding: NSUTF8StringEncoding];
+    NSArray *serialArray = [string componentsSeparatedByString:@"\n"];
+    for (NSString *port in serialArray) {
+        if([port length] > 0){
+            [portsBtn addItemWithTitle:port];
+        }
+    }
+}
+
+- (void) portsBtnAction:(id)sender {
+    NSInteger selectedItem = [sender indexOfSelectedItem];
+    NSString *selectedObject = [sender itemTitleAtIndex:selectedItem];
+    [sender setTitle: selectedObject];
+}
+
+- (void)appendToIncomingText: (id) text {
+    
+    NSString *valueStr = [NSString stringWithFormat:@"%@",text];
+    NSAttributedString* attrString = [[NSMutableAttributedString alloc] initWithString: valueStr];
+    NSTextStorage *textStorage = [txtView textStorage];
+    [textStorage beginEditing];
+    [textStorage appendAttributedString:attrString];
+    [textStorage endEditing];
+    // update the graphView
+    [graphView setNeedsDisplay:YES];
+    
+    NSRange myRange = NSMakeRange([textStorage length],0);
+    [txtView scrollRangeToVisible:myRange];
+}
+
+void USBSerialGetLine(int fd,char buffer[]) {
+    char *bufptr;
+    long nbytes;
+    char inchar;
+    bufptr = buffer;
+    
+    while ((nbytes = read(fd, &inchar, 1)) > 0) {
+        if (inchar == '\r') continue;
+        if (inchar == '\n') break; // frame marker is line feed
+        *bufptr = inchar;
+        // printf("inchar = %c\n",inchar);
+        ++bufptr;
+    }
+    *bufptr = '\0';
+}
+
+- (void)incomingTextUpdateThread: (NSThread *) parentThread {
+    char buffer[256];
+    
+    while (1) {
+        USBSerialGetLine(fd, buffer);
+        // process the line that was read here
+        // printf("value = %s\n",buffer);
+        dataValue = atoi(buffer);
+        counter++;
+        if(counter == 1){
+            [path moveToPoint:CGPointMake(0,dataValue) ];
+        }
+        dataPt.x = counter;
+        dataPt.y = dataValue;
+        [path lineToPoint:dataPt];
+        if(counter > currWndW - 140){
+            counter = 0;
+            [path removeAllPoints];
+        }
+        NSString *dataStr = [NSString stringWithFormat:@"%d\n",dataValue];
+        [self performSelectorOnMainThread:@selector(appendToIncomingText:) withObject:dataStr waitUntilDone:YES];
+        if(closePort) break;
+    }
+}
+
+- (void) openPortAction: (id)sender {
+    struct termios options;
+    closePort = NO;
+    // Open USB Serial Port
+    const char *portPath = [[portsBtn titleOfSelectedItem] cStringUsingEncoding:NSUTF8StringEncoding];
+    comboBaudRate = [baudCombo itemObjectValueAtIndex:[baudCombo indexOfSelectedItem]];
+    if ([comboBaudRate intValue] > 0) {
+        baudRate = [comboBaudRate intValue];
+    }
+    fd = open(portPath, O_RDWR | O_NOCTTY | O_NDELAY);
+    if (fd == -1) {
+        printf("open_port: Unable to open serial port - ");
+    } else fcntl(fd, F_SETFL, 0);
+    /* set the port to 9600 Baud, 8 data bits, etc. */
+    tcgetattr(fd, &options);
+    cfsetispeed(&options, baudRate ); //B9600
+    cfsetospeed(&options, baudRate ); //B9600
+    options.c_cflag |= (CLOCAL | CREAD);
+    options.c_cflag &= ~CSIZE; /* Mask the character size bits */
+    options.c_cflag |= CS8;    /* Select 8 data bits */
+    options.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tcsetattr(fd, TCSANOW, &options);
+    tcflush(fd, TCIFLUSH); // Added
+   // printf("fd = %d\n",fd);
+    [self performSelectorInBackground: @selector(incomingTextUpdateThread:) withObject: [NSThread currentThread]];
+}
+
+- (void) closePortAction: (id)sender {
+    close(fd);
+    closePort = YES;
+    fd = -1;
+}
+
+- (void) rescanAction: (id)sender{
+    [self getSerialPorts];
+}
+
+- (void) buildMenu {
+    NSMenu *menubar = [NSMenu new];
+    [NSApp setMainMenu:menubar];
+    NSMenuItem *appMenuItem = [NSMenuItem new];
+    NSMenu *appMenu = [NSMenu new];
+    [appMenu addItemWithTitle: @"Quit" action:@selector(terminate:) keyEquivalent:@"q"];
+    [appMenuItem setSubmenu:appMenu];
+    [menubar addItem:appMenuItem];
+}
+
+- (void) buildWindow {
+    window = [[NSWindow alloc] initWithContentRect: NSMakeRect( 0, 0, _wndW, _wndH )
+                                         styleMask: NSWindowStyleMaskTitled | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable backing: NSBackingStoreBuffered defer: NO];
+    
+    [window center];
+    [window setTitle: @"SerialC_ObjC Demo"];
+    [window setDelegate: self];
+    [window makeKeyAndOrderFront: nil];
+    
+    // **** Intializations **** //
+    path = [NSBezierPath bezierPath];
+    counter = 0;
+    dataValue = 0;
+    currWndW = _wndW;
+    comboBaudRate = @"";
+    
+    // **** Info Field **** //
+    infoFld = [[NSTextField alloc] initWithFrame:NSMakeRect( 20, _wndH - 45, _wndW - 40, 24 )];
+    [infoFld setBackgroundColor: [NSColor clearColor]];
+    [infoFld setSelectable:NO];
+    [infoFld setBordered:NO];
+    [infoFld setFont:[NSFont fontWithName: @"Lucida Grande" size:14]];
+    [infoFld setAutoresizingMask: NSViewMinYMargin];
+    [infoFld setStringValue:@"Select port and baud rate.  Hit 'Connect' to acquire data."];
+    [[window contentView] addSubview:infoFld];
+        
+    // **** Ports PopUpButton **** //
+    portsBtn = [[NSPopUpButton alloc] initWithFrame:NSMakeRect( 20, _wndH - 80, 240, 24 )];
+    [portsBtn setPullsDown:YES];
+    [portsBtn addItemWithTitle:@"Select port"];
+    [portsBtn setAction:@selector(portsBtnAction:)];
+    [portsBtn setAutoresizingMask: NSViewMinYMargin];
+    [[window contentView] addSubview: portsBtn];
+    
+    // **** BaudRate ComboBox **** //
+    baudCombo = [[NSComboBox alloc] initWithFrame:NSMakeRect( 275, _wndH - 80, 90, 24 )];
+    [baudCombo setItemHeight: 16];
+    [baudCombo setFont: [NSFont fontWithName:@"Lucida Grande" size:12.0]];
+    NSArray *rate = [NSArray arrayWithObjects: @"2400", @"4800",@"9600", @"19200", @"38400", @"57600",@"115200", nil];
+    [baudCombo addItemsWithObjectValues:rate];
+    [baudCombo setEditable:NO];
+    [baudCombo selectItemAtIndex:0];
+    [baudCombo setAutoresizingMask: NSViewMinYMargin];
+    [[window contentView] addSubview:baudCombo];
+    
+    // **** Connect Button **** //
+    NSButton *connectBtn =[[NSButton alloc]initWithFrame:NSMakeRect( 370, _wndH - 80, 95, 24 )];
+    [connectBtn setBezelStyle:NSBezelStyleRounded ];
+    [connectBtn setTitle: @"Connect"];
+    [connectBtn setAction: @selector (openPortAction:)];
+    [connectBtn setAutoresizingMask: NSViewMinYMargin];
+    [[window contentView] addSubview: connectBtn];
+    
+    // **** Disconnect Button **** //
+    NSButton *disconnectBtn =[[NSButton alloc]initWithFrame:NSMakeRect( 475, _wndH - 80, 105, 24 )];
+    [disconnectBtn setBezelStyle:NSBezelStyleRounded ];
+    [disconnectBtn setTitle: @"Disconnect"];
+    [disconnectBtn setAction: @selector (closePortAction:)];
+    [disconnectBtn setAutoresizingMask: NSViewMinYMargin];
+    [[window contentView] addSubview: disconnectBtn];
+    
+    // **** Rescan Button **** //
+    NSButton *rescanBtn =[[NSButton alloc]initWithFrame:NSMakeRect( 590, _wndH - 80, 105, 24 )];
+    [rescanBtn setBezelStyle:NSBezelStylePush ];
+    [rescanBtn setTitle: @"Rescan"];
+    [rescanBtn setAction: @selector (rescanAction:)];
+    [rescanBtn setAutoresizingMask: NSViewMinYMargin];
+    [[window contentView] addSubview: rescanBtn];
+    
+    // **** Text Scroll View **** //
+    txtScrlView = [[NSScrollView alloc] initWithFrame:NSMakeRect( 20, _wndH - 450, 100, 350 )];
+    [txtScrlView setBorderType:NSBezelBorder];
+    [txtScrlView setHasVerticalScroller: YES];
+    [txtScrlView setHasHorizontalScroller: YES];
+    [txtScrlView setAutohidesScrollers:YES];
+    [txtScrlView setAutoresizingMask: NSViewHeightSizable];
+    
+    // **** Text View **** //
+    txtView = [[NSTextView alloc] initWithFrame:NSMakeRect( 0, 0, 80, 350 )];
+    [txtView setFont:[NSFont fontWithName:@"Lucida Grande" size: 14]];
+    [txtView setEditable:NO];
+    [txtScrlView setDocumentView: txtView];
+    [[window contentView] addSubview:txtScrlView];
+    
+    // **** Graph Scroll View **** //
+    graphScrlView = [[NSScrollView alloc] initWithFrame: NSMakeRect(120, _wndH - 450,_wndW - 140, 350)];
+    [graphScrlView setBorderType:NSBezelBorder];
+    [graphScrlView setAutoresizingMask:NSViewHeightSizable | NSViewWidthSizable];
+    
+    // **** Graph View **** //
+    graphView = [[GraphView alloc]initWithFrame:NSMakeRect( 0, 0, _wndW - 140, 350 )];
+    [graphView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [graphView setPath:path];
+    
+    [graphScrlView setDocumentView:graphView];
+    [[window contentView] addSubview:graphScrlView];
+    
+    // **** Quit btn **** //
+    NSButton *quitBtn = [[NSButton alloc]initWithFrame:NSMakeRect( _wndW - 50, 5, 40, 40 )];
+    [quitBtn setBezelStyle:NSBezelStyleCircular ];
+    [quitBtn setTitle: @"Q" ];
+    [quitBtn setAutoresizingMask: NSViewMinXMargin];
+    [quitBtn setAction:@selector(terminate:)];
+    [quitBtn setAutoresizingMask: NSViewMinXMargin | NSViewMaxYMargin];
+    [[window contentView] addSubview: quitBtn];
+}
+
+- (void)windowDidResize:(NSNotification *)notification {
+    currWndW = window.frame.size.width;
+}
+
+- (void) applicationWillFinishLaunching: (NSNotification *)notification {
+    [self buildMenu];
+    [self buildWindow];
+}
+
+- (void) applicationDidFinishLaunching: (NSNotification *)notification {
+    [self getSerialPorts];
+}
+
+@end
+
+int main (void) {
+    NSApplication *application = [NSApplication sharedApplication];
+    AppDelegate *appDelegate = [[AppDelegate alloc] init];
+    [application setDelegate:appDelegate];
+    [application run];
+    return 0;
+}
+
+
+// ============ Arduino Code ============= //
+/*
+ // Used with SerialC_ObjC
+ 
+ unsigned long LoopTimer = 0;
+ byte outputValue = 0;
+ char outStr[5];
+ const int LoopTimeInterval = 50;
+ 
+ void setup() {
+ Serial.begin(9600);
+ }
+ 
+ void loop() {
+ if (millis() > LoopTimer ) {
+ LoopTimer += LoopTimeInterval;
+ outputValue += 8;
+ sprintf(outStr,"%03d",outputValue);  // Left pads with zeroes
+ Serial.println(outStr); // Adds line feed as frame marker
+ }
+ }
+ */
